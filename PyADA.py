@@ -32,12 +32,12 @@ import sys
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.Qt import PYQT_VERSION_STR
 from PyQt5.QtGui import QFont, QIcon, QPixmap
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, pyqtSlot, QRunnable, \
-                         QThreadPool, QT_VERSION_STR
-from PyQt5.QtWidgets import QApplication, QDialog, QDialogButtonBox, \
-                            QFormLayout, QGroupBox, QHBoxLayout, QLabel, \
-                            QLineEdit, QMainWindow, QMessageBox, \
-                            QPushButton, QTextEdit, QVBoxLayout, QWidget
+from PyQt5.QtCore import (Qt, QObject, pyqtSignal, pyqtSlot, QMutex,
+                          QRunnable, QThreadPool, QT_VERSION_STR)
+from PyQt5.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
+                             QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                             QLineEdit, QMainWindow, QMessageBox,
+                             QPushButton, QTextEdit, QVBoxLayout, QWidget)
 
 # a few string constants
 PROJECT_ID = u'q5NT3BzY2P73EzKfCprE1oprU6Nx1yq1'
@@ -132,6 +132,15 @@ cardano_ada_logo = [
 ] # };
 
 
+# one instance of QMutex to ensure we do not use
+# BlockFrost API concurrently (it does not work)
+_data_mutex = QMutex()
+# and another for UI updates, we could have used
+# only one but then we would loose more time in
+# lock situation
+_ui_mutex = QMutex()
+
+
 ''' custom signal for inter-threads asynchronous communication as per RiverBank
 documentation (https://www.riverbankcomputing.com/static/Docs/PyQt5/signals_slots.html):
 «New signals should only be defined in sub-classes of QObject. They must be
@@ -154,7 +163,8 @@ class ITCommunication(QObject):
     def get_dataready_signal(self):
         return self.data_ready_sig
 
-# worker thread
+''' worker thread that calls fetch_data()
+and emit data_ready signal when done '''
 class Worker(QRunnable):
     # :param args: callback method in PyADA
     def __init__(self, *args, **kwargs):
@@ -172,6 +182,7 @@ class Worker(QRunnable):
     thread update the UI'''
     @pyqtSlot()
     def run(self):
+        _data_mutex.lock();
         #  print(self.args, self.kwargs)
         # if callback is defined then we use it
         if self.args[0] is not None:
@@ -179,11 +190,9 @@ class Worker(QRunnable):
             # emit the data_ready signal.
             self.data_ready.get_dataready_signal().emit()
             #  print('data ready signal emitted')
+        _data_mutex.unlock();
 
-    # getter method for the sake of encapsulation
-    def get_dataready_signal(self):
-        return self.data_ready
-
+''' our main class '''
 class PyADA(QMainWindow):
 
     def __init__(self, *args, **kwargs):
@@ -256,7 +265,7 @@ class PyADA(QMainWindow):
         buttonBox.addButton(btnAbout, QtWidgets.QDialogButtonBox.ActionRole)
         buttonBox.rejected.connect(self.close)
         btnAbout.clicked.connect(self.show_about)
-        buttonBox.button(QtWidgets.QDialogButtonBox.Reset).clicked.connect(self.clearFields)
+        buttonBox.button(QtWidgets.QDialogButtonBox.Reset).clicked.connect(self.clear_fields)
         return buttonBox
 
     def setup_ui(self):
@@ -343,21 +352,8 @@ class PyADA(QMainWindow):
         fg.moveCenter(centerpt)
         self.move(fg.topLeft())
 
-    def clearFields(self):
-        # we disconnect signal before clearing stake,
-        # otherwise update_data() will be called twice
-        self.sk.textChanged.disconnect(self.update_data)
-        self.sk.setText('')
-        self.sk.textChanged.connect(self.update_data)
-
-        self.epochLE.setText('')
-        self.poolName.setText('')
-        self.poolTicker.setText('')
-        self.ctrlAmount.setText('')
-        self.rewardsSum.setText('')
-        self.rewardsDetails.setText('')
-
-    # check that we are indeed connected to the Internet, to avoid ugly exceptions
+    ''' check that we are indeed connected to the Internet,
+    and try to gracefully handle ugly exceptions '''
     @staticmethod
     def is_connected():
         try:
@@ -372,22 +368,45 @@ class PyADA(QMainWindow):
         return False
 
     @pyqtSlot()
+    def clear_fields(self):
+
+        _ui_mutex.lock()
+        # we disconnect signal before clearing stake,
+        # otherwise update_data() will be called twice
+        self.sk.textChanged.disconnect(self.update_data)
+        self.sk.setText('')
+        self.sk.textChanged.connect(self.update_data)
+
+        self.epochLE.setText('')
+        self.poolName.setText('')
+        self.poolTicker.setText('')
+        self.ctrlAmount.setText('')
+        self.rewardsSum.setText('')
+        self.rewardsDetails.setText('')
+
+        _ui_mutex.unlock()
+
+    @pyqtSlot()
     def update_data(self):
 
         self.stake_key = self.sk.text()
         # we care only about meaningful text changes
         if len(self.stake_key) == STAKE_KEY_LEN:
-            # we pass fetch_data as the function to execute (callback) and the
-            # pyQtSlot for when the data will be ready
+            # we pass fetch_data as the function to execute (callback)
+            # and the pyQtSlot for when the data will be ready
             worker = Worker(self.fetch_data, self.update_ui)
             # hic sunt dracones
             self.threadpool.start(worker)
 
         else:
-            self.clearFields()
+            self.clear_fields()
 
     @pyqtSlot()
     def update_ui(self):
+
+        # make sure we are robust (and foolproof) by
+        # protecting UI updating with a dedicated mutex.
+        _ui_mutex.lock()
 
         if self.epoch:
             self.epochLE.setText(f'{self.epoch}')
@@ -399,21 +418,30 @@ class PyADA(QMainWindow):
             self.ctrlAmount.setText(f'{self.ctrl_amount} {ADA_SYMBOL}')
             # no div by zero
             self.rewardsSum.setText(f'{self.rew_sum} {ADA_SYMBOL} ({self.rew_sum * 100 / self.ctrl_amount:.2f} %)')
+        if self.rewards:
+            # we empty the QTextEdit first, it fixes a bug when user try to
+            # refresh very quickly and it appends data before having a chance
+            # to properly clear the field
+            self.rewardsDetails.setText('')
+            for element in self.rewards:
+                epoch = 0
+                reward = ''
+                # iterate through JSON elements, items() call does only make
+                # sense on a dictionary, however in some cases (e.g. insanely
+                # quick refreshing) it does happen to be an str
+                if isinstance(element, dict):
+                    for key, val in element.items():
+                        if key == 'epoch':
+                            epoch = val
+                        if key == 'amount':
+                            reward = int(val) / 1000000
+                        if len(f'{epoch}') and len(f'{reward}'):
+                            break
+                    # make sure we have something meaningful to display
+                    if epoch != 0 and reward:
+                        self.rewardsDetails.append(f'Epoch {epoch} => {reward} {ADA_SYMBOL}')
 
-        # iterate through JSON elements
-        for element in self.rewards:
-            epoch = 0
-            reward = ''
-            for key, val in element.items():
-                if key == 'epoch':
-                    epoch = val
-                if key == 'amount':
-                    reward = int(val) / 1000000
-                if len(f'{epoch}') and len(f'{reward}'):
-                    break
-            # make sure we have something meaningful to display
-            if epoch != 0 and reward:
-                self.rewardsDetails.append(f'Epoch {epoch} => {reward} {ADA_SYMBOL}')
+        _ui_mutex.unlock()
 
     def keyPressEvent(self, e):
         # we want to exit on <Esc> key stroke
