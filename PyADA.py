@@ -29,10 +29,11 @@ import signal
 import sys
 
 # PyQT imports for GUI
-from PyQt5 import QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.Qt import PYQT_VERSION_STR
-from PyQt5.QtCore import Qt, QObject, pyqtSlot, QRunnable, QThreadPool, QT_VERSION_STR
 from PyQt5.QtGui import QFont, QIcon, QPixmap
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, pyqtSlot, QRunnable, \
+                         QThreadPool, QT_VERSION_STR
 from PyQt5.QtWidgets import QApplication, QDialog, QDialogButtonBox, \
                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, \
                             QLineEdit, QMainWindow, QMessageBox, \
@@ -51,6 +52,8 @@ PYADA_REWARDS_INFO = u'Cardano staking information'
 PYADA_STAKE_KEY = u'Enter your stake key'
 QUIT_MSG = u'Are you sure you want to exit the program ?'
 BUTTON_ABOUT = 'About'
+# a stake key is 59 bytes long
+STAKE_KEY_LEN = 59
 
 # Cardano logo from https://cardano.org/brand-assets/ and converted to XPM
 # format using ImageMagick
@@ -129,20 +132,57 @@ cardano_ada_logo = [
 ] # };
 
 
-# Worker thread
+''' custom signal for inter-threads asynchronous communication as per RiverBank
+documentation (https://www.riverbankcomputing.com/static/Docs/PyQt5/signals_slots.html):
+«New signals should only be defined in sub-classes of QObject. They must be
+part of the class definition and cannot be dynamically added as class
+attributes after the class has been defined.» '''
+class ITCommunication(QObject):
+    # data_ready custom signal, no argument there
+    data_ready_sig = pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        #  print('__init__ ITCommunication')
+        super(ITCommunication, self).__init__()
+        self.args = args
+        self.kwargs = kwargs
+        # connect the data_ready signal to the proper slot.
+        self.data_ready_sig.connect(self.args[0])
+        #  print(f'data_ready_sig connected to {self.args[0]}')
+
+    # getter method for the sake of encapsulation
+    def get_dataready_signal(self):
+        return self.data_ready_sig
+
+# worker thread
 class Worker(QRunnable):
     # :param args: callback method in PyADA
     def __init__(self, *args, **kwargs):
+        #  print('__init__ Worker')
         super(Worker, self).__init__()
         self.args = args
         self.kwargs = kwargs
+        # prepaere data ready signal for asynchronous
+        # communication between threads
+        self.data_ready = ITCommunication(args[1])
 
+    ''' Although QObject is reentrant, the GUI classes, notably QtWidgets and all
+    its subclasses, are not reentrant. They can only be used from the main
+    thread. That's why we use signal and slot mechanism to make the main
+    thread update the UI'''
     @pyqtSlot()
     def run(self):
         #  print(self.args, self.kwargs)
+        # if callback is defined then we use it
         if self.args[0] is not None:
             self.args[0]()
+            # emit the data_ready signal.
+            self.data_ready.get_dataready_signal().emit()
+            #  print('data ready signal emitted')
 
+    # getter method for the sake of encapsulation
+    def get_dataready_signal(self):
+        return self.data_ready
 
 class PyADA(QMainWindow):
 
@@ -175,7 +215,8 @@ class PyADA(QMainWindow):
 
         skgb = QGroupBox(PYADA_STAKE_KEY)
         l = QHBoxLayout()
-        self.sk.setMaxLength(59)
+        # we need to acount for 0x00
+        self.sk.setMaxLength(STAKE_KEY_LEN + 1)
         self.sk.setAlignment(Qt.AlignRight)
         # call our very own custom slot on signal textChanged
         self.sk.textChanged.connect(self.update_data)
@@ -245,54 +286,25 @@ class PyADA(QMainWindow):
 
     def fetch_data(self):
 
-        r = self.do_http_get('/epochs/latest')
-        self.epoch = r.json()['epoch']
+        try:
 
-        j = self.do_http_get('/accounts/{}'.format(self.stake_key)).json()
-        self.pool_id = j['pool_id']
-        self.ctrl_amount = int(j['controlled_amount']) / 1000000
-        self.rew_sum = int(j['rewards_sum']) / 1000000
+            r = self.do_http_get('/epochs/latest')
+            self.epoch = r.json()['epoch']
 
-        j = self.do_http_get('/pools/{}/metadata'.format(self.pool_id)).json()
-        self.pool_ticker = j['ticker']
-        self.pool_name = j['name']
+            j = self.do_http_get('/accounts/{}'.format(self.stake_key)).json()
+            self.pool_id = j['pool_id']
+            self.ctrl_amount = int(j['controlled_amount']) / 1000000
+            self.rew_sum = int(j['rewards_sum']) / 1000000
 
-        j = self.do_http_get('/accounts/{}/rewards'.format(self.stake_key)).json()
-        self.rewards = j
+            j = self.do_http_get('/pools/{}/metadata'.format(self.pool_id)).json()
+            self.pool_ticker = j['ticker']
+            self.pool_name = j['name']
 
-        # TBD: instead of updating UI syncronously and possibly block UI
-        # refreshing (web data fetching is a typical I/O-bound processing), we
-        # could use signal and slot mechanism which provides us with a mean to
-        # stay asynchronous
-        self.update_ui()
+            j = self.do_http_get('/accounts/{}/rewards'.format(self.stake_key)).json()
+            self.rewards = j
 
-    def update_ui(self):
-
-        if self.epoch:
-            self.epochLE.setText(f'{self.epoch}')
-        if self.pool_ticker:
-            self.poolTicker.setText(f'{self.pool_ticker}')
-        if self.pool_name:
-            self.poolName.setText(f'{self.pool_name}')
-        if self.ctrl_amount:
-            self.ctrlAmount.setText(f'{self.ctrl_amount} {ADA_SYMBOL}')
-            # no div by zero
-            self.rewardsSum.setText(f'{self.rew_sum} {ADA_SYMBOL} ({self.rew_sum * 100 / self.ctrl_amount:.2f} %)')
-
-        # iterate through JSON elements
-        for element in self.rewards:
-            epoch = 0
-            reward = ''
-            for key, val in element.items():
-                if key == 'epoch':
-                    epoch = val
-                if key == 'amount':
-                    reward = int(val) / 1000000
-                if len(f'{epoch}') and len(f'{reward}'):
-                    break
-            # make sure we have something meaningful to display
-            if epoch != 0 and reward:
-                self.rewardsDetails.append(f'Epoch {epoch} => {reward} {ADA_SYMBOL}')
+        except KeyError as ke:
+            print('Invalid stake key')
 
     def set_window_icon(self):
         
@@ -363,14 +375,45 @@ class PyADA(QMainWindow):
     def update_data(self):
 
         self.stake_key = self.sk.text()
-        # a stake key is 59 bytes long
-        if len(self.stake_key) == 59:
-            # we pass fetch_data as the function to execute (callback)
-            worker = Worker(self.fetch_data)
+        # we care only about meaningful text changes
+        if len(self.stake_key) == STAKE_KEY_LEN:
+            # we pass fetch_data as the function to execute (callback) and the
+            # pyQtSlot for when the data will be ready
+            worker = Worker(self.fetch_data, self.update_ui)
+            # hic sunt dracones
             self.threadpool.start(worker)
 
         else:
             self.clearFields()
+
+    @pyqtSlot()
+    def update_ui(self):
+
+        if self.epoch:
+            self.epochLE.setText(f'{self.epoch}')
+        if self.pool_ticker:
+            self.poolTicker.setText(f'{self.pool_ticker}')
+        if self.pool_name:
+            self.poolName.setText(f'{self.pool_name}')
+        if self.ctrl_amount:
+            self.ctrlAmount.setText(f'{self.ctrl_amount} {ADA_SYMBOL}')
+            # no div by zero
+            self.rewardsSum.setText(f'{self.rew_sum} {ADA_SYMBOL} ({self.rew_sum * 100 / self.ctrl_amount:.2f} %)')
+
+        # iterate through JSON elements
+        for element in self.rewards:
+            epoch = 0
+            reward = ''
+            for key, val in element.items():
+                if key == 'epoch':
+                    epoch = val
+                if key == 'amount':
+                    reward = int(val) / 1000000
+                if len(f'{epoch}') and len(f'{reward}'):
+                    break
+            # make sure we have something meaningful to display
+            if epoch != 0 and reward:
+                self.rewardsDetails.append(f'Epoch {epoch} => {reward} {ADA_SYMBOL}')
 
     def keyPressEvent(self, e):
         # we want to exit on <Esc> key stroke
